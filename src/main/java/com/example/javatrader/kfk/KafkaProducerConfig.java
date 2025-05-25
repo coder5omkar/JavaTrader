@@ -1,8 +1,10 @@
 package com.example.javatrader.kfk;
 
+import com.example.javatrader.model.OrderStatusMessage;
 import com.example.javatrader.model.TickerData;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.StringSerializer;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.core.*;
@@ -14,17 +16,37 @@ import java.util.Map;
 @Configuration
 public class KafkaProducerConfig {
 
+    @Value("${spring.kafka.bootstrap-servers}")
+    private String bootstrapServers;
+
     @Bean
-    public ProducerFactory<String, TickerData> producerFactory() {
+    public ProducerFactory<String, TickerData> tickerDataProducerFactory() {
         Map<String, Object> configProps = new HashMap<>();
-        configProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        configProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        configProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        configProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+        configProps.put(ProducerConfig.ACKS_CONFIG, "all"); // Ensure message durability
+        configProps.put(ProducerConfig.RETRIES_CONFIG, 3); // Retry failed sends
+        return new DefaultKafkaProducerFactory<>(configProps);
+    }
+
+    @Bean
+    public ProducerFactory<String, OrderStatusMessage> orderStatusProducerFactory() {
+        // Similar config for OrderStatus messages
+        Map<String, Object> configProps = new HashMap<>();
+        configProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         configProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
         configProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
         return new DefaultKafkaProducerFactory<>(configProps);
     }
 
     @Bean
-    public KafkaTemplate<String, TickerData> kafkaTemplate() {
-        return new KafkaTemplate<>(producerFactory());
+    public KafkaTemplate<String, TickerData> tickerDataKafkaTemplate() {
+        return new KafkaTemplate<>(tickerDataProducerFactory());
+    }
+
+    @Bean
+    public KafkaTemplate<String, OrderStatusMessage> orderStatusKafkaTemplate() {
+        return new KafkaTemplate<>(orderStatusProducerFactory());
     }
 }
