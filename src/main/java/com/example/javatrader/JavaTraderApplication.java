@@ -9,6 +9,8 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 
 import jakarta.annotation.PostConstruct;
+import org.springframework.kafka.core.KafkaTemplate;
+
 import java.net.URI;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -29,6 +31,9 @@ public class JavaTraderApplication {
 
     @Autowired
     private TickerDataRepository tickerDataRepository;
+
+    @Autowired
+    private KafkaTemplate<String, TickerData> kafkaTemplate;
 
     public static void main(String[] args) {
         SpringApplication.run(JavaTraderApplication.class, args);
@@ -79,6 +84,11 @@ public class JavaTraderApplication {
     private void saveTickerData(float ltp, int ltt) {
         LocalDateTime receivedAt = LocalDateTime.ofInstant(Instant.ofEpochSecond(ltt), ZoneId.systemDefault());
         TickerData data = new TickerData(ltp, ltt, receivedAt);
+
+        // Publish to Kafka topic before saving to DB
+        kafkaTemplate.send("ticker-data-topic", data);
+
+        // Save to DB
         tickerDataRepository.save(data);
     }
 }
