@@ -17,7 +17,6 @@ import org.springframework.kafka.core.KafkaTemplate;
 
 import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.URL;
 import java.nio.file.Files;
@@ -26,7 +25,6 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
-import java.time.temporal.TemporalAdjusters;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -145,6 +143,7 @@ public class JavaTraderApplication {
                             instrument.put("OptionType", tokens[6]);
                             instrument.put("ExpiryDate", tokens[7]);
                             instrument.put("SecurityId", tokens[1]);
+                            instrument.put("CustomSymbol", tokens[8]); // Added for better symbol matching
 
                             newLookup.put(key, instrument);
                         });
@@ -196,17 +195,22 @@ public class JavaTraderApplication {
 
                     if (!subscribedToOptions.get()) {
                         int strike = Math.round(ltp / strikeMultiple) * strikeMultiple;
-                        String expiry = getNearestThursdayExpiry();
+                        List<String> expiryDates = getValidExpiryDates();
 
-                        String callId = findInstrumentId(niftySymbol, strike, "CE", expiry);
-                        String putId = findInstrumentId(niftySymbol, strike, "PE", expiry);
+                        for (String expiry : expiryDates) {
+                            String callId = findInstrumentId(niftySymbol, strike, "CE", expiry);
+                            String putId = findInstrumentId(niftySymbol, strike, "PE", expiry);
 
-                        if (callId != null && putId != null) {
-                            subscribeToOptionInstruments(callId, putId);
-                            subscribedToOptions.set(true);
-                            logger.info("Subscribed to ATM options: Strike={}, Call={}, Put={}",
-                                    strike, callId, putId);
-                        } else {
+                            if (callId != null && putId != null) {
+                                subscribeToOptionInstruments(callId, putId);
+                                subscribedToOptions.set(true);
+                                logger.info("Subscribed to ATM options: Strike={}, Expiry={}, Call={}, Put={}",
+                                        strike, expiry, callId, putId);
+                                break;
+                            }
+                        }
+
+                        if (!subscribedToOptions.get()) {
                             logger.warn("Failed to find option instruments for strike: {}", strike);
                         }
                     }
@@ -217,6 +221,37 @@ public class JavaTraderApplication {
             logger.error("Initial connection failed", e);
             scheduleReconnect();
         }
+    }
+
+    private List<String> getValidExpiryDates() {
+        LocalDate today = LocalDate.now();
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd-MMM-yyyy");
+
+        // Get all unique expiry dates from the instrument lookup
+        Set<String> uniqueExpiries = instrumentLookup.values().stream()
+                .map(instr -> instr.get("ExpiryDate"))
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+
+        // Filter and sort them (nearest first)
+        return uniqueExpiries.stream()
+                .filter(expiry -> {
+                    try {
+                        LocalDate expiryDate = LocalDate.parse(expiry, formatter);
+                        return !expiryDate.isBefore(today) &&
+                                expiryDate.getDayOfWeek() == DayOfWeek.THURSDAY;
+                    } catch (Exception e) {
+                        return false;
+                    }
+                })
+                .sorted(Comparator.comparing(expiry -> {
+                    try {
+                        return LocalDate.parse(expiry, formatter);
+                    } catch (Exception e) {
+                        return LocalDate.MAX;
+                    }
+                }))
+                .collect(Collectors.toList());
     }
 
     private void subscribeToOptionInstruments(String callId, String putId) {
@@ -254,6 +289,7 @@ public class JavaTraderApplication {
     }
 
     private String findInstrumentId(String underlying, int strikePrice, String optionType, String expiryDate) {
+        // First try exact match
         String key = buildInstrumentKey(
                 "NSE",
                 underlying,
@@ -263,13 +299,24 @@ public class JavaTraderApplication {
         );
 
         Map<String, String> instrument = instrumentLookup.get(key);
-        return instrument != null ? instrument.get("SecurityId") : null;
-    }
+        if (instrument != null) {
+            return instrument.get("SecurityId");
+        }
 
-    private String getNearestThursdayExpiry() {
-        LocalDate today = LocalDate.now();
-        LocalDate nextThursday = today.with(TemporalAdjusters.nextOrSame(DayOfWeek.THURSDAY));
-        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd-MMM-yyyy");
-        return nextThursday.format(formatter).toUpperCase();
+        // If exact match not found, try to find the closest match using custom symbol
+        String searchPattern = String.format("%s %s %d %s",
+                underlying,
+                expiryDate.split("-")[1], // Month
+                strikePrice,
+                optionType.equals("CE") ? "CALL" : "PUT");
+
+        Optional<Map.Entry<String, Map<String, String>>> match = instrumentLookup.entrySet().parallelStream()
+                .filter(e -> {
+                    String customSymbol = e.getValue().get("CustomSymbol");
+                    return customSymbol != null && customSymbol.contains(searchPattern);
+                })
+                .findFirst();
+
+        return match.map(e -> e.getValue().get("SecurityId")).orElse(null);
     }
 }
