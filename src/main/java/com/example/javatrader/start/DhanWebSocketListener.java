@@ -5,4 +5,5 @@ public interface DhanWebSocketListener {
     void onDisconnected();
     void onError(Exception ex);
     void onDataReceived(float ltp, int ltt);
+    void onTextMessage(String message);
 }

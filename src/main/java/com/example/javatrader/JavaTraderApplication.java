@@ -4,6 +4,7 @@ import com.example.javatrader.model.TickerData;
 import com.example.javatrader.repository.TickerDataRepository;
 import com.example.javatrader.start.DhanWebSocketClient;
 import com.example.javatrader.start.DhanWebSocketListener;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
@@ -56,17 +57,23 @@ public class JavaTraderApplication {
     @Value("${nifty.symbol:NIFTY}")
     private String niftySymbol;
 
-    private DhanWebSocketClient client;
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-    private final AtomicBoolean subscribedToOptions = new AtomicBoolean(false);
-    private volatile Map<String, Map<String, String>> instrumentLookup = new ConcurrentHashMap<>();
-    private ScheduledExecutorService instrumentListRefresher;
+    @Value("${nifty.security.id:13}")
+    private String niftySecurityId;
 
     @Autowired
     private TickerDataRepository tickerDataRepository;
 
     @Autowired
     private KafkaTemplate<String, TickerData> kafkaTemplate;
+
+    private DhanWebSocketClient client;
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private final AtomicBoolean subscribedToOptions = new AtomicBoolean(false);
+    private volatile Map<String, Map<String, String>> instrumentLookup = new ConcurrentHashMap<>();
+    private ScheduledExecutorService instrumentListRefresher;
+    private volatile float lastSubscribedNiftyPrice = 0;
+    private String currentCallId;
+    private String currentPutId;
 
     public static void main(String[] args) {
         SpringApplication.run(JavaTraderApplication.class, args);
@@ -143,7 +150,7 @@ public class JavaTraderApplication {
                             instrument.put("OptionType", tokens[6]);
                             instrument.put("ExpiryDate", tokens[7]);
                             instrument.put("SecurityId", tokens[1]);
-                            instrument.put("CustomSymbol", tokens[8]); // Added for better symbol matching
+                            instrument.put("CustomSymbol", tokens[8]);
 
                             newLookup.put(key, instrument);
                         });
@@ -174,6 +181,8 @@ public class JavaTraderApplication {
                 public void onConnected() {
                     logger.info("WebSocket connected");
                     subscribedToOptions.set(false);
+                    // Subscribe to NIFTY index immediately after connection
+                    subscribeToNiftyIndex();
                 }
 
                 @Override
@@ -193,27 +202,15 @@ public class JavaTraderApplication {
                     logger.debug("Market data - LTP: {}, LTT: {}", ltp, ltt);
                     saveTickerData(ltp, ltt);
 
-                    if (!subscribedToOptions.get()) {
-                        int strike = Math.round(ltp / strikeMultiple) * strikeMultiple;
-                        List<String> expiryDates = getValidExpiryDates();
-
-                        for (String expiry : expiryDates) {
-                            String callId = findInstrumentId(niftySymbol, strike, "CE", expiry);
-                            String putId = findInstrumentId(niftySymbol, strike, "PE", expiry);
-
-                            if (callId != null && putId != null) {
-                                subscribeToOptionInstruments(callId, putId);
-                                subscribedToOptions.set(true);
-                                logger.info("Subscribed to ATM options: Strike={}, Expiry={}, Call={}, Put={}",
-                                        strike, expiry, callId, putId);
-                                break;
-                            }
-                        }
-
-                        if (!subscribedToOptions.get()) {
-                            logger.warn("Failed to find option instruments for strike: {}", strike);
-                        }
+                    // Check if we need to subscribe to new options
+                    if (Math.abs(ltp - lastSubscribedNiftyPrice) >= strikeMultiple || !subscribedToOptions.get()) {
+                        subscribeToAtmOptions(ltp);
                     }
+                }
+
+                @Override
+                public void onTextMessage(String message) {
+                    logger.debug("Received text message: {}", message);
                 }
             });
             client.connect();
@@ -223,17 +220,93 @@ public class JavaTraderApplication {
         }
     }
 
+    private void subscribeToNiftyIndex() {
+        String subscriptionMessage = String.format(
+                "{\"action\":\"subscribe\",\"instruments\":[{" +
+                        "\"exchangeSegment\":\"NSE_INDICES\",\"instrumentId\":\"%s\"}]}",
+                niftySecurityId
+        );
+        client.sendWithGuarantee(subscriptionMessage);
+        logger.info("Subscribed to NIFTY index");
+    }
+
+    private void subscribeToAtmOptions(float currentPrice) {
+        int strike = Math.round(currentPrice / strikeMultiple) * strikeMultiple;
+        List<String> expiryDates = getValidExpiryDates();
+
+        for (String expiry : expiryDates) {
+            String callId = findInstrumentId(niftySymbol, strike, "CE", expiry);
+            String putId = findInstrumentId(niftySymbol, strike, "PE", expiry);
+
+            if (callId != null && putId != null) {
+                // First unsubscribe from previous options if any
+                if (currentCallId != null && currentPutId != null) {
+                    unsubscribeFromOptions(currentCallId, currentPutId);
+                }
+
+                // Subscribe to new options
+                subscribeToOptionInstruments(callId, putId);
+
+                // Update tracking variables
+                lastSubscribedNiftyPrice = currentPrice;
+                currentCallId = callId;
+                currentPutId = putId;
+                subscribedToOptions.set(true);
+
+                logger.info("Subscribed to ATM options: Price={}, Strike={}, Expiry={}, Call={}, Put={}",
+                        currentPrice, strike, expiry, callId, putId);
+                break;
+            }
+        }
+
+        if (!subscribedToOptions.get()) {
+            logger.warn("Failed to find option instruments for current price: {}", currentPrice);
+        }
+    }
+
+    private void unsubscribeFromOptions(String callId, String putId) {
+        try {
+            // Construct the unsubscribe message as per DhanHQ's API v2
+            Map<String, Object> unsubscribeMessage = new HashMap<>();
+            unsubscribeMessage.put("RequestCode", 16); // 16 indicates an unsubscribe request
+            unsubscribeMessage.put("InstrumentCount", 2);
+
+            List<Map<String, String>> instrumentList = new ArrayList<>();
+
+            Map<String, String> callInstrument = new HashMap<>();
+            callInstrument.put("ExchangeSegment", "NSE_FNO");
+            callInstrument.put("SecurityId", callId);
+
+            Map<String, String> putInstrument = new HashMap<>();
+            putInstrument.put("ExchangeSegment", "NSE_FNO");
+            putInstrument.put("SecurityId", putId);
+
+            instrumentList.add(callInstrument);
+            instrumentList.add(putInstrument);
+
+            unsubscribeMessage.put("InstrumentList", instrumentList);
+
+            // Convert the message to JSON
+            ObjectMapper objectMapper = new ObjectMapper();
+            String jsonMessage = objectMapper.writeValueAsString(unsubscribeMessage);
+
+            // Send the unsubscribe message over the WebSocket
+            client.sendWithGuarantee(jsonMessage);
+            logger.info("Unsubscribed from previous options: Call={}, Put={}", callId, putId);
+        } catch (Exception e) {
+            logger.error("Failed to unsubscribe from options", e);
+        }
+    }
+
     private List<String> getValidExpiryDates() {
         LocalDate today = LocalDate.now();
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd-MMM-yyyy");
 
-        // Get all unique expiry dates from the instrument lookup
         Set<String> uniqueExpiries = instrumentLookup.values().stream()
-                .map(instr -> instr.get("ExpiryDate"))
+                .map(instr -> (String) instr.get("ExpiryDate"))  // Cast to String
                 .filter(Objects::nonNull)
                 .collect(Collectors.toSet());
 
-        // Filter and sort them (nearest first)
         return uniqueExpiries.stream()
                 .filter(expiry -> {
                     try {
@@ -255,13 +328,34 @@ public class JavaTraderApplication {
     }
 
     private void subscribeToOptionInstruments(String callId, String putId) {
-        String subscriptionMessage = String.format(
-                "{\"action\":\"subscribe\",\"instruments\":[{" +
-                        "\"exchangeSegment\":\"NSE_FNO\",\"instrumentId\":\"%s\"}," +
-                        "{\"exchangeSegment\":\"NSE_FNO\",\"instrumentId\":\"%s\"}]}",
-                callId, putId
-        );
-        client.sendWithGuarantee(subscriptionMessage);
+        try {
+            Map<String, Object> subscriptionMessage = new HashMap<>();
+            subscriptionMessage.put("RequestCode", 15); // 15 = subscribe request
+            subscriptionMessage.put("InstrumentCount", 2);
+
+            List<Map<String, String>> instrumentList = new ArrayList<>();
+
+            Map<String, String> callInstrument = new HashMap<>();
+            callInstrument.put("ExchangeSegment", "NSE_FNO");
+            callInstrument.put("SecurityId", callId);
+
+            Map<String, String> putInstrument = new HashMap<>();
+            putInstrument.put("ExchangeSegment", "NSE_FNO");
+            putInstrument.put("SecurityId", putId);
+
+            instrumentList.add(callInstrument);
+            instrumentList.add(putInstrument);
+
+            subscriptionMessage.put("InstrumentList", instrumentList);
+
+            ObjectMapper objectMapper = new ObjectMapper();
+            String jsonMessage = objectMapper.writeValueAsString(subscriptionMessage);
+
+            client.sendWithGuarantee(jsonMessage);
+            logger.info("Subscribed to options: Call={}, Put={}", callId, putId);
+        } catch (Exception e) {
+            logger.error("Subscription failed", e);
+        }
     }
 
     private void scheduleReconnect() {
@@ -289,7 +383,6 @@ public class JavaTraderApplication {
     }
 
     private String findInstrumentId(String underlying, int strikePrice, String optionType, String expiryDate) {
-        // First try exact match
         String key = buildInstrumentKey(
                 "NSE",
                 underlying,
@@ -303,10 +396,9 @@ public class JavaTraderApplication {
             return instrument.get("SecurityId");
         }
 
-        // If exact match not found, try to find the closest match using custom symbol
         String searchPattern = String.format("%s %s %d %s",
                 underlying,
-                expiryDate.split("-")[1], // Month
+                expiryDate.split("-")[1],
                 strikePrice,
                 optionType.equals("CE") ? "CALL" : "PUT");
 

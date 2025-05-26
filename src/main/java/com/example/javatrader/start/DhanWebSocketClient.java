@@ -59,6 +59,7 @@ public class DhanWebSocketClient extends WebSocketClient {
     @Override
     public void onMessage(String message) {
         logger.debug("Received text message: {}", message);
+        listener.onTextMessage(message);
     }
 
     @Override
@@ -109,11 +110,6 @@ public class DhanWebSocketClient extends WebSocketClient {
         } else {
             logger.error("Max reconnection attempts reached");
         }
-    }
-
-    private void subscribeToInstruments() {
-        String subscriptionMessage = "{\"action\":\"subscribe\",\"instruments\":[{\"exchangeSegment\":\"NSE_EQ\",\"instrumentId\":\"1330\"}]}";
-        sendWithGuarantee(subscriptionMessage);
     }
 
     private void startHeartbeat() {

@@ -19,7 +19,7 @@ public class OptionFinder {
 
     public static void main(String[] args) throws IOException {
         String filePath = "instrument_cache.csv";
-        int spotPrice = 24823;
+        int spotPrice = 24312;
         String index = "NIFTY";
 
         OptionData atmCall = findATMOption(filePath, spotPrice, "CALL", index);
