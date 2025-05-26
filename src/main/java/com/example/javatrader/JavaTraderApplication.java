@@ -221,13 +221,29 @@ public class JavaTraderApplication {
     }
 
     private void subscribeToNiftyIndex() {
-        String subscriptionMessage = String.format(
-                "{\"action\":\"subscribe\",\"instruments\":[{" +
-                        "\"exchangeSegment\":\"NSE_INDICES\",\"instrumentId\":\"%s\"}]}",
-                niftySecurityId
-        );
-        client.sendWithGuarantee(subscriptionMessage);
-        logger.info("Subscribed to NIFTY index");
+        try {
+            Map<String, Object> subscriptionMessage = new HashMap<>();
+            subscriptionMessage.put("RequestCode", 15); // 15 = subscribe
+
+            subscriptionMessage.put("InstrumentCount", 1);
+
+            Map<String, String> instrument = new HashMap<>();
+            instrument.put("ExchangeSegment", "NSE_INDICES");
+            instrument.put("SecurityId", niftySecurityId); // Make sure this is a valid ID
+
+            List<Map<String, String>> instrumentList = new ArrayList<>();
+            instrumentList.add(instrument);
+
+            subscriptionMessage.put("InstrumentList", instrumentList);
+
+            ObjectMapper objectMapper = new ObjectMapper();
+            String json = objectMapper.writeValueAsString(subscriptionMessage);
+
+            client.sendWithGuarantee(json);
+            logger.info("Subscribed to NIFTY index with SecurityId={}", niftySecurityId);
+        } catch (Exception e) {
+            logger.error("Failed to subscribe to NIFTY index", e);
+        }
     }
 
     private void subscribeToAtmOptions(float currentPrice) {
