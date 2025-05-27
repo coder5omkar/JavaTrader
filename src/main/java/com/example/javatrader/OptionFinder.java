@@ -17,9 +17,11 @@ public class OptionFinder {
         int securityId;
     }
 
-    public void main(String[] args) throws IOException {
+    public static void main(String[] args) throws IOException {
+        long startTime = System.nanoTime(); // Start time
+
         String filePath = "instrument_cache.csv";
-        int spotPrice = 24830;
+        int spotPrice = 24520;
         String index = "NIFTY";
 
         OptionData atmCall = findATMOption(filePath, spotPrice, "CALL", index);
@@ -27,7 +29,13 @@ public class OptionFinder {
 
         System.out.println("ATM CALL: " + (atmCall != null ? atmCall.customSymbol + " - Security ID: " + atmCall.securityId : "Not Found"));
         System.out.println("ATM PUT:  " + (atmPut != null ? atmPut.customSymbol + " - Security ID: " + atmPut.securityId : "Not Found"));
+
+        long endTime = System.nanoTime(); // End time
+        long durationInMillis = (endTime - startTime) / 1_000_000;
+
+        System.out.println("Total time taken: " + durationInMillis + " ms");
     }
+
 
     public static OptionData findATMOption(String filePath, int spotPrice, String type, String index) throws IOException {
         LocalDate today = LocalDate.now();

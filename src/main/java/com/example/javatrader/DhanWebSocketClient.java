@@ -12,37 +12,52 @@ import java.nio.file.Paths;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.*;
 
 public class DhanWebSocketClient extends WebSocketClient {
 
+    private static volatile float lastTradedPrice;
+    private static DhanWebSocketClient instance;
+
     public DhanWebSocketClient(URI serverUri) {
         super(serverUri);
+        instance = this;
+    }
+
+    public static final Map<Integer, String> securityMap = new HashMap<>();
+    static {
+        securityMap.put(13, "NIFTY 50");
     }
 
     public static void main(String[] args) {
         try {
-            String accessToken = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4NDE2NTIwLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMTIwODI3MyJ9.aKANXnP3hkgtPLEx8yL9dYOruZxpRaRt2q3blu1_bvbCFQ-apcvrU9wKfP1UQXLl1Ry07Ui_PapdjZtOoPabhA";
-            String clientId = "1101208273";
-
+            String accessToken = "YOUR_ACCESS_TOKEN";
+            String clientId = "YOUR_CLIENT_ID";
             String url = "wss://api-feed.dhan.co?version=2&token=" + accessToken + "&clientId=" + clientId + "&authType=2";
             DhanWebSocketClient client = new DhanWebSocketClient(new URI(url));
             client.connect();
+
+            // Schedule OptionFind() every 40 minutes
+            ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+            scheduler.scheduleAtFixedRate(() -> {
+                if (lastTradedPrice > 0) {
+                    try {
+                        instance.OptionFind(lastTradedPrice);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                }
+            }, 0, 40, TimeUnit.MINUTES);
+
         } catch (Exception e) {
             e.printStackTrace();
         }
-    }
-
-    public static final Map<Integer, String> securityMap = new HashMap<>();
-
-    static {
-        securityMap.put(13, "NIFTY 50");
     }
 
     @Override
     public void onOpen(ServerHandshake handshakedata) {
         System.out.println("Connected to DhanHQ WebSocket");
 
-        // Subscribe to multiple instruments: NIFTY 50 and two NSE_FNO securities with ID 61727
         String subscribeMessage = "{\n" +
                 "  \"RequestCode\": 15,\n" +
                 "  \"InstrumentCount\": 1,\n" +
@@ -50,28 +65,22 @@ public class DhanWebSocketClient extends WebSocketClient {
                 "    {\n" +
                 "      \"ExchangeSegment\": \"IDX_I\",\n" +
                 "      \"SecurityId\": \"13\"\n" +
-                "    },\n" +
+                "    }\n" +
                 "  ]\n" +
                 "}";
-
         send(subscribeMessage);
     }
 
     public void subscribeATMOptions(List<Map<String, String>> instruments) {
         StringBuilder instrumentListBuilder = new StringBuilder();
-
         for (int i = 0; i < instruments.size(); i++) {
             Map<String, String> instrument = instruments.get(i);
             instrumentListBuilder.append("    {\n")
                     .append("      \"ExchangeSegment\": \"").append(instrument.get("ExchangeSegment")).append("\",\n")
                     .append("      \"SecurityId\": \"").append(instrument.get("SecurityId")).append("\"\n")
                     .append("    }");
-
-            if (i < instruments.size() - 1) {
-                instrumentListBuilder.append(",\n");
-            } else {
-                instrumentListBuilder.append("\n");
-            }
+            if (i < instruments.size() - 1) instrumentListBuilder.append(",\n");
+            else instrumentListBuilder.append("\n");
         }
 
         String newSubscribeMessage = "{\n" +
@@ -81,7 +90,6 @@ public class DhanWebSocketClient extends WebSocketClient {
                 instrumentListBuilder +
                 "  ]\n" +
                 "}";
-
         send(newSubscribeMessage);
     }
 
@@ -93,47 +101,27 @@ public class DhanWebSocketClient extends WebSocketClient {
     @Override
     public void onMessage(ByteBuffer bytes) {
         try {
-            bytes.order(ByteOrder.LITTLE_ENDIAN); // DHAN uses little-endian
-
-            // Read header (8 bytes)
-            byte feedResponseCode = bytes.get(); // 1 byte
-            short messageLength = bytes.getShort(); // 2 bytes
-            byte exchangeSegment = bytes.get(); // 1 byte
-            int securityId = bytes.getInt(); // 4 bytes
+            bytes.order(ByteOrder.LITTLE_ENDIAN);
+            byte feedResponseCode = bytes.get();
+            short messageLength = bytes.getShort();
+            byte exchangeSegment = bytes.get();
+            int securityId = bytes.getInt();
+            float ltp = bytes.getFloat();
+            int lastTradedTime = bytes.getInt();
 
             String securityName = securityMap.getOrDefault(securityId, "UNKNOWN");
+            LocalDateTime ltt = Instant.ofEpochSecond(lastTradedTime).atZone(ZoneId.systemDefault()).toLocalDateTime();
 
-            // Read payload
-            float lastTradedPrice = bytes.getFloat(); // 4 bytes
-            int lastTradedTime = bytes.getInt(); // e.g., 1716805200
-            LocalDateTime ltt = Instant.ofEpochSecond(lastTradedTime)
-                    .atZone(ZoneId.systemDefault())
-                    .toLocalDateTime();      // 4 bytes
+            lastTradedPrice = ltp;
 
-            // Convert LTP (already in rupees)
-            double ltp = lastTradedPrice;
-
-            // Convert LTT (treat as IST timezone)
-//            ZoneId istZone = ZoneId.of("Asia/Kolkata");
-//            LocalDateTime istTime = LocalDateTime.ofInstant(
-//                    Instant.ofEpochSecond(lastTradedTime),
-//                    istZone
-//            );
-
-            // Convert to your local timezone (optional)
-            LocalDateTime now = LocalDateTime.now(); // Get current local date and time
-            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd MMM yy hh:mm:ss a"); // Format: 27 May 25 04:21 PM
+            LocalDateTime now = LocalDateTime.now();
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd MMM yy hh:mm:ss a");
             String formattedDateTime = now.format(formatter);
-            System.out.println(formattedDateTime);
 
-            System.out.printf("%s (ID: %d) - LTP: ₹%.2f, LTT (Local):",
-                    securityName,
-                    securityId,
-                    lastTradedPrice,
-                    formattedDateTime);
-
+            System.out.printf("%s (ID: %d) - LTP: ₹%.2f, LTT (Local): %s\n",
+                    securityName, securityId, ltp, formattedDateTime);
             System.out.println("_____________________________________________________________");
-            // Save data
+
             if (securityName.equals("NIFTY 50")) {
                 DatabaseUtil.saveToDB("nifty_data", securityId, securityName, ltp, ltt);
             } else if (securityName.endsWith("CALL")) {
@@ -142,18 +130,14 @@ public class DhanWebSocketClient extends WebSocketClient {
                 DatabaseUtil.saveToDB("put_data", securityId, securityName, ltp, ltt);
             }
 
-            //option find method call
-            OptionFind(lastTradedPrice);
-
         } catch (Exception e) {
             System.err.println("Error parsing binary message: " + e.getMessage());
-            e.printStackTrace();
         }
     }
 
     @Override
     public void onClose(int code, String reason, boolean remote) {
-        System.out.println("WebSocket closed. Code: " + code + ", Reason: " + reason + ", Remote: " + remote);
+        System.out.println("WebSocket closed. Code: " + code + ", Reason: " + reason);
     }
 
     @Override
@@ -161,17 +145,9 @@ public class DhanWebSocketClient extends WebSocketClient {
         System.err.println("WebSocket error: " + ex.getMessage());
     }
 
-    static class OptionData {
-        String customSymbol;
-        int strikePrice;
-        LocalDate expiryDate;
-        String type;
-        int securityId;
-    }
-
     public void OptionFind(float price) throws IOException {
         String filePath = "instrument_cache.csv";
-        int spotPrice = Integer.parseInt(String.valueOf(price));
+        int spotPrice = Math.round(price);
         String index = "NIFTY";
 
         OptionFinder.OptionData atmCall = findATMOption(filePath, spotPrice, "CALL", index);
@@ -180,22 +156,26 @@ public class DhanWebSocketClient extends WebSocketClient {
         System.out.println("ATM CALL: " + (atmCall != null ? atmCall.customSymbol + " - Security ID: " + atmCall.securityId : "Not Found"));
         System.out.println("ATM PUT:  " + (atmPut != null ? atmPut.customSymbol + " - Security ID: " + atmPut.securityId : "Not Found"));
 
-        // Add to global security map
-        if (atmCall != null) {
-            securityMap.put(atmCall.securityId, atmCall.customSymbol);
-        }
-        if (atmPut != null) {
-            securityMap.put(atmPut.securityId, atmPut.customSymbol);
-        }
-
-        Map<String, String> map = new HashMap();
-        map.put(atmCall.customSymbol, String.valueOf(atmCall.securityId));
-        map.put(atmPut.customSymbol, String.valueOf(atmPut.securityId));
+        if (atmCall != null) securityMap.put(atmCall.securityId, atmCall.customSymbol);
+        if (atmPut != null) securityMap.put(atmPut.securityId, atmPut.customSymbol);
 
         List<Map<String, String>> instruments = new ArrayList<>();
-        instruments.add(map);
+        if (atmCall != null) {
+            Map<String, String> callMap = new HashMap<>();
+            callMap.put("ExchangeSegment", "NSE_FNO");
+            callMap.put("SecurityId", String.valueOf(atmCall.securityId));
+            instruments.add(callMap);
+        }
+        if (atmPut != null) {
+            Map<String, String> putMap = new HashMap<>();
+            putMap.put("ExchangeSegment", "NSE_FNO");
+            putMap.put("SecurityId", String.valueOf(atmPut.securityId));
+            instruments.add(putMap);
+        }
 
-        subscribeATMOptions(instruments);
+        if (!instruments.isEmpty()) {
+            subscribeATMOptions(instruments);
+        }
     }
 
     public static OptionFinder.OptionData findATMOption(String filePath, int spotPrice, String type, String index) throws IOException {
@@ -207,17 +187,14 @@ public class DhanWebSocketClient extends WebSocketClient {
                 .filter(tokens -> tokens.length > 7)
                 .map(tokens -> {
                     try {
-                        String symbol = tokens[7].replaceAll("\"", "").trim(); // SEM_CUSTOM_SYMBOL
-                        if (!symbol.startsWith(index + " ")) return null;
-                        if (!symbol.endsWith(type)) return null;
+                        String symbol = tokens[7].replaceAll("\"", "").trim();
+                        if (!symbol.startsWith(index + " ") || !symbol.endsWith(type)) return null;
 
                         int strike = extractStrike(symbol);
                         LocalDate expiry = extractExpiryDate(symbol);
-                        if (expiry == null || expiry.isBefore(today) || expiry.getDayOfWeek() != DayOfWeek.THURSDAY) {
-                            return null;
-                        }
+                        if (expiry == null || expiry.isBefore(today) || expiry.getDayOfWeek() != DayOfWeek.THURSDAY) return null;
 
-                        int secId = Integer.parseInt(tokens[2].trim()); // SEM_SMST_SECURITY_I
+                        int secId = Integer.parseInt(tokens[2].trim());
 
                         OptionFinder.OptionData data = new OptionFinder.OptionData();
                         data.customSymbol = symbol;
@@ -249,18 +226,12 @@ public class DhanWebSocketClient extends WebSocketClient {
 
     private static LocalDate extractExpiryDate(String symbol) {
         try {
-            // Example: NIFTY 29 MAY 18250 CALL → extract 29 MAY
             String[] parts = symbol.split(" ");
             int day = Integer.parseInt(parts[1]);
             Month month = Month.valueOf(parts[2].toUpperCase());
-            int year = Year.now().getValue(); // Assume current year
-
+            int year = Year.now().getValue();
             LocalDate date = LocalDate.of(year, month, day);
-            // If this date has already passed this year, assume next year expiry
-            if (date.isBefore(LocalDate.now())) {
-                date = date.plusYears(1);
-            }
-
+            if (date.isBefore(LocalDate.now())) date = date.plusYears(1);
             return date;
         } catch (Exception e) {
             return null;
