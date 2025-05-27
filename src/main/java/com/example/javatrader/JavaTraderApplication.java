@@ -27,10 +27,7 @@ import java.nio.file.StandardCopyOption;
 import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
@@ -60,6 +57,9 @@ public class JavaTraderApplication {
     @Value("${nifty.security.id:13}")
     private String niftySecurityId;
 
+    @Value("${reconnect.delay.seconds:10}")
+    private int reconnectDelaySeconds;
+
     @Autowired
     private TickerDataRepository tickerDataRepository;
 
@@ -74,6 +74,8 @@ public class JavaTraderApplication {
     private volatile float lastSubscribedNiftyPrice = 0;
     private String currentCallId;
     private String currentPutId;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final AtomicBoolean connectionInProgress = new AtomicBoolean(false);
 
     public static void main(String[] args) {
         SpringApplication.run(JavaTraderApplication.class, args);
@@ -82,16 +84,16 @@ public class JavaTraderApplication {
     @PostConstruct
     public void start() {
         initInstrumentList();
-        scheduleInstrumentListRefresh();
+//        scheduleInstrumentListRefresh();
         connectWithRetry();
     }
 
     @PreDestroy
     public void shutdown() {
         logger.info("Shutting down application");
-        scheduler.shutdown();
+        scheduler.shutdownNow();
         if (instrumentListRefresher != null) {
-            instrumentListRefresher.shutdown();
+            instrumentListRefresher.shutdownNow();
         }
         if (client != null) {
             client.close();
@@ -174,6 +176,10 @@ public class JavaTraderApplication {
     }
 
     private void connectWithRetry() {
+        if (connectionInProgress.getAndSet(true)) {
+            return;
+        }
+
         try {
             String wsUrl = String.format(wsUrlTemplate, accessToken, clientId);
             client = new DhanWebSocketClient(new URI(wsUrl), new DhanWebSocketListener() {
@@ -181,7 +187,6 @@ public class JavaTraderApplication {
                 public void onConnected() {
                     logger.info("WebSocket connected");
                     subscribedToOptions.set(false);
-                    // Subscribe to NIFTY index immediately after connection
                     subscribeToNiftyIndex();
                 }
 
@@ -217,6 +222,8 @@ public class JavaTraderApplication {
         } catch (Exception e) {
             logger.error("Initial connection failed", e);
             scheduleReconnect();
+        } finally {
+            connectionInProgress.set(false);
         }
     }
 
@@ -224,25 +231,23 @@ public class JavaTraderApplication {
         try {
             Map<String, Object> subscriptionMessage = new HashMap<>();
             subscriptionMessage.put("RequestCode", 15); // 15 = subscribe
-
             subscriptionMessage.put("InstrumentCount", 1);
 
             Map<String, String> instrument = new HashMap<>();
             instrument.put("ExchangeSegment", "NSE_INDICES");
-            instrument.put("SecurityId", niftySecurityId); // Make sure this is a valid ID
+            instrument.put("SecurityId", niftySecurityId);
 
             List<Map<String, String>> instrumentList = new ArrayList<>();
             instrumentList.add(instrument);
 
             subscriptionMessage.put("InstrumentList", instrumentList);
 
-            ObjectMapper objectMapper = new ObjectMapper();
             String json = objectMapper.writeValueAsString(subscriptionMessage);
-
             client.sendWithGuarantee(json);
             logger.info("Subscribed to NIFTY index with SecurityId={}", niftySecurityId);
         } catch (Exception e) {
             logger.error("Failed to subscribe to NIFTY index", e);
+//            scheduleReconnect();
         }
     }
 
@@ -282,7 +287,6 @@ public class JavaTraderApplication {
 
     private void unsubscribeFromOptions(String callId, String putId) {
         try {
-            // Construct the unsubscribe message as per DhanHQ's API v2
             Map<String, Object> unsubscribeMessage = new HashMap<>();
             unsubscribeMessage.put("RequestCode", 16); // 16 indicates an unsubscribe request
             unsubscribeMessage.put("InstrumentCount", 2);
@@ -302,11 +306,7 @@ public class JavaTraderApplication {
 
             unsubscribeMessage.put("InstrumentList", instrumentList);
 
-            // Convert the message to JSON
-            ObjectMapper objectMapper = new ObjectMapper();
             String jsonMessage = objectMapper.writeValueAsString(unsubscribeMessage);
-
-            // Send the unsubscribe message over the WebSocket
             client.sendWithGuarantee(jsonMessage);
             logger.info("Unsubscribed from previous options: Call={}, Put={}", callId, putId);
         } catch (Exception e) {
@@ -319,7 +319,7 @@ public class JavaTraderApplication {
         DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd-MMM-yyyy");
 
         Set<String> uniqueExpiries = instrumentLookup.values().stream()
-                .map(instr -> (String) instr.get("ExpiryDate"))  // Cast to String
+                .map(instr -> instr.get("ExpiryDate"))
                 .filter(Objects::nonNull)
                 .collect(Collectors.toSet());
 
@@ -364,9 +364,7 @@ public class JavaTraderApplication {
 
             subscriptionMessage.put("InstrumentList", instrumentList);
 
-            ObjectMapper objectMapper = new ObjectMapper();
             String jsonMessage = objectMapper.writeValueAsString(subscriptionMessage);
-
             client.sendWithGuarantee(jsonMessage);
             logger.info("Subscribed to options: Call={}, Put={}", callId, putId);
         } catch (Exception e) {
@@ -375,7 +373,11 @@ public class JavaTraderApplication {
     }
 
     private void scheduleReconnect() {
-        scheduler.schedule(this::connectWithRetry, 10, TimeUnit.SECONDS);
+        scheduler.schedule(() -> {
+            if (!connectionInProgress.get()) {
+                connectWithRetry();
+            }
+        }, reconnectDelaySeconds, TimeUnit.SECONDS);
     }
 
     private void saveTickerData(float ltp, int ltt) {
@@ -384,14 +386,18 @@ public class JavaTraderApplication {
             TickerData data = new TickerData(ltp, ltt, receivedAt);
 
             scheduler.execute(() -> {
-                kafkaTemplate.send("ticker-data-topic", data)
-                        .thenAccept(result -> logger.debug("Sent tick data to Kafka"))
-                        .exceptionally(ex -> {
-                            logger.error("Failed to send tick data to Kafka", ex);
-                            return null;
-                        });
+                try {
+                    kafkaTemplate.send("ticker-data-topic", data)
+                            .thenAccept(result -> logger.debug("Sent tick data to Kafka"))
+                            .exceptionally(ex -> {
+                                logger.error("Failed to send tick data to Kafka", ex);
+                                return null;
+                            });
 
-                tickerDataRepository.save(data);
+                    tickerDataRepository.save(data);
+                } catch (Exception e) {
+                    logger.error("Error processing tick data", e);
+                }
             });
         } catch (Exception e) {
             logger.error("Error saving tick data", e);

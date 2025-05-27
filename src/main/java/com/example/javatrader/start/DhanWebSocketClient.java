@@ -12,6 +12,7 @@ import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class DhanWebSocketClient extends WebSocketClient {
@@ -23,7 +24,12 @@ public class DhanWebSocketClient extends WebSocketClient {
     private final BlockingQueue<String> messageQueue = new LinkedBlockingQueue<>();
     private static final int MAX_RECONNECT_ATTEMPTS = 5;
     private static final long INITIAL_RECONNECT_DELAY_MS = 1000;
+    private static final long MAX_RECONNECT_DELAY_MS = 60000;
     private static final long HEARTBEAT_INTERVAL_MS = 30000;
+    private static final long RATE_LIMIT_DELAY_MS = 60000;
+    private static final long MESSAGE_DELAY_MS = 150;
+    private final AtomicBoolean reconnectInProgress = new AtomicBoolean(false);
+    private final AtomicBoolean rateLimited = new AtomicBoolean(false);
 
     public DhanWebSocketClient(URI serverUri, DhanWebSocketListener listener) {
         super(serverUri);
@@ -33,6 +39,8 @@ public class DhanWebSocketClient extends WebSocketClient {
     @Override
     public void onOpen(ServerHandshake handshakedata) {
         reconnectAttempts.set(0);
+        reconnectInProgress.set(false);
+        rateLimited.set(false);
         logger.info("Connected to DhanHQ WebSocket");
         processQueuedMessages();
         startHeartbeat();
@@ -41,11 +49,12 @@ public class DhanWebSocketClient extends WebSocketClient {
 
     private void processQueuedMessages() {
         new Thread(() -> {
-            while (!messageQueue.isEmpty()) {
+            while (!messageQueue.isEmpty() && isOpen()) {
                 try {
                     String message = messageQueue.take();
                     this.send(message);
                     logger.debug("Sent queued message: {}", message);
+                    Thread.sleep(MESSAGE_DELAY_MS); // prevent spamming
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
@@ -76,7 +85,16 @@ public class DhanWebSocketClient extends WebSocketClient {
         logger.warn("Connection closed. Code: {}, Reason: {}, Remote: {}", code, reason, remote);
         stopHeartbeat();
         listener.onDisconnected();
-        attemptReconnect();
+
+        // Handle 429 Too Many Requests with special delay
+        if (reason != null && reason.contains("429")) {
+            rateLimited.set(true);
+            logger.warn("Received 429 Too Many Requests. Delaying reconnect by {} seconds.", RATE_LIMIT_DELAY_MS/1000);
+            scheduleReconnect(RATE_LIMIT_DELAY_MS);
+        } else {
+            rateLimited.set(false);
+            attemptReconnect();
+        }
     }
 
     @Override
@@ -89,27 +107,74 @@ public class DhanWebSocketClient extends WebSocketClient {
         if (!isOpen()) {
             messageQueue.add(message);
             logger.debug("Queued message while disconnected");
-            if (reconnectAttempts.get() == 0) {
-                attemptReconnect();
+//            attemptReconnect();
+            return;
+        }
+
+        try {
+            // Add extra delay if we're recovering from rate limiting
+            if (rateLimited.get()) {
+                Thread.sleep(RATE_LIMIT_DELAY_MS);
+                rateLimited.set(false);
+            } else {
+                Thread.sleep(MESSAGE_DELAY_MS);
             }
-        } else {
+
             send(message);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            logger.error("Error while sending message", e);
+            messageQueue.add(message); // retry later
+//            attemptReconnect();
         }
     }
 
     private void attemptReconnect() {
-        if (reconnectAttempts.incrementAndGet() <= MAX_RECONNECT_ATTEMPTS) {
-            long delay = INITIAL_RECONNECT_DELAY_MS * (long) Math.pow(2, reconnectAttempts.get() - 1);
-            logger.info("Scheduling reconnect attempt {} in {} ms", reconnectAttempts.get(), delay);
-            new Timer().schedule(new TimerTask() {
-                @Override
-                public void run() {
-                    reconnect();
-                }
-            }, delay);
-        } else {
-            logger.error("Max reconnection attempts reached");
+        synchronized (reconnectInProgress) {
+            if (isOpen() || reconnectInProgress.get()) {
+                return;
+            }
+
+            if (reconnectAttempts.incrementAndGet() <= MAX_RECONNECT_ATTEMPTS) {
+                reconnectInProgress.set(true);
+                long delay = calculateReconnectDelay();
+                logger.info("Scheduling reconnect attempt {} in {} ms", reconnectAttempts.get(), delay);
+                scheduleReconnect(delay);
+            } else {
+                logger.error("Max reconnection attempts reached. Giving up.");
+                reconnectAttempts.set(0); // Reset for next time
+            }
         }
+    }
+
+    private long calculateReconnectDelay() {
+        if (rateLimited.get()) {
+            return RATE_LIMIT_DELAY_MS;
+        }
+        return Math.min(
+                INITIAL_RECONNECT_DELAY_MS * (1L << (reconnectAttempts.get() - 1)),
+                MAX_RECONNECT_DELAY_MS
+        );
+    }
+
+    private void scheduleReconnect(long delayMs) {
+        new Timer().schedule(new TimerTask() {
+            @Override
+            public void run() {
+                try {
+                    if (!isOpen()) {
+                        logger.info("Attempting reconnect...");
+                        reconnect();
+                    }
+                } catch (Exception e) {
+                    logger.error("Reconnect failed", e);
+                    attemptReconnect(); // try again
+                } finally {
+                    reconnectInProgress.set(false);
+                }
+            }
+        }, delayMs);
     }
 
     private void startHeartbeat() {
@@ -117,10 +182,16 @@ public class DhanWebSocketClient extends WebSocketClient {
         heartbeatTimer.scheduleAtFixedRate(new TimerTask() {
             @Override
             public void run() {
-                sendWithGuarantee("ping");
-                logger.debug("Sent heartbeat");
+                try {
+                    if (isOpen()) {
+                        sendWithGuarantee("ping");
+                        logger.debug("Sent heartbeat");
+                    }
+                } catch (Exception e) {
+                    logger.error("Failed to send heartbeat", e);
+                }
             }
-        }, 0, HEARTBEAT_INTERVAL_MS);
+        }, HEARTBEAT_INTERVAL_MS, HEARTBEAT_INTERVAL_MS);
     }
 
     private void stopHeartbeat() {
