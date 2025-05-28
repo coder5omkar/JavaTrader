@@ -21,6 +21,7 @@ public class DhanWebSocketClient extends WebSocketClient {
     private static DhanWebSocketClient instance;
     private static final Set<Integer> subscribedOptionIds = new HashSet<>();
     private static final int STRIKE_RANGE = 50; // 50 points around current price for ATM
+    private static String url ;
 
     public DhanWebSocketClient(URI serverUri) {
         super(serverUri);
@@ -34,9 +35,9 @@ public class DhanWebSocketClient extends WebSocketClient {
 
     public static void main(String[] args) {
         try {
-            String accessToken = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4NDE2NTIwLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMTIwODI3MyJ9.aKANXnP3hkgtPLEx8yL9dYOruZxpRaRt2q3blu1_bvbCFQ-apcvrU9wKfP1UQXLl1Ry07Ui_PapdjZtOoPabhA";
+            String accessToken = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4NTAxODc1LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMTIwODI3MyJ9.I-MRNZOBalsTu1g1g-irRfkPGtcgnRH45630A_TKpgMYrbg-fhormWVCCzTvSCZXDbpwIoZ1-ENd4vMk3LeYwA";
             String clientId = "1101208273";
-            String url = "wss://api-feed.dhan.co?version=2&token=" + accessToken + "&clientId=" + clientId + "&authType=2";
+            url = "wss://api-feed.dhan.co?version=2&token=" + accessToken + "&clientId=" + clientId + "&authType=2";
             DhanWebSocketClient client = new DhanWebSocketClient(new URI(url));
             client.connect();
 
@@ -132,6 +133,8 @@ public class DhanWebSocketClient extends WebSocketClient {
         System.out.println("Received message: " + message);
     }
 
+    private final Map<Integer, Integer> tickCountMap = new ConcurrentHashMap<>();
+
     @Override
     public void onMessage(ByteBuffer bytes) {
         try {
@@ -143,18 +146,24 @@ public class DhanWebSocketClient extends WebSocketClient {
             float ltp = bytes.getFloat();
             int lastTradedTime = bytes.getInt();
 
+            tickCountMap.putIfAbsent(securityId, 0);
+            int tickCount = tickCountMap.get(securityId);
+
+            if (tickCount < 3) {
+                tickCountMap.put(securityId, tickCount + 1);
+                return; // Skip initial ticks
+            }
+
             String securityName = securityMap.getOrDefault(securityId, "UNKNOWN");
             LocalDateTime ltt = Instant.ofEpochSecond(lastTradedTime).atZone(ZoneId.systemDefault()).toLocalDateTime();
 
             lastTradedPrice = ltp;
-
-            LocalDateTime now = LocalDateTime.now();
             DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd MMM yy hh:mm:ss a");
-            String formattedDateTime = now.format(formatter);
+            String formattedDateTime = ltt.format(formatter); // <-- FIXED
 
             System.out.printf("%s (ID: %d) - LTP: ₹%.2f, LTT (Local): %s\n",
                     securityName, securityId, ltp, formattedDateTime);
-            System.out.println("_____________________________________________________________");
+//            System.out.println("_____________________________________________________________");
 
             if (securityName.equals("NIFTY 50")) {
                 DatabaseUtil.saveToDB("nifty_data", securityId, securityName, ltp, ltt);
@@ -169,9 +178,29 @@ public class DhanWebSocketClient extends WebSocketClient {
         }
     }
 
+
     @Override
     public void onClose(int code, String reason, boolean remote) {
         System.out.println("WebSocket closed. Code: " + code + ", Reason: " + reason);
+        // Optional: add delay before reconnect
+        try {
+            Thread.sleep(5000); // 5 seconds delay
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        // Reconnect logic
+        reconnectWebSocket();
+
+    }
+
+    public void reconnectWebSocket() {
+        try {
+            // Ensure you properly clean up or reuse your existing WebSocket client
+            DhanWebSocketClient newClient = new DhanWebSocketClient(new URI(url));
+            newClient.connect();
+        } catch (Exception e) {
+            System.err.println("WebSocket reconnection failed: " + e.getMessage());
+        }
     }
 
     @Override
