@@ -13,11 +13,14 @@ import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 public class DhanWebSocketClient extends WebSocketClient {
 
     private static volatile float lastTradedPrice;
     private static DhanWebSocketClient instance;
+    private static final Set<Integer> subscribedOptionIds = new HashSet<>();
+    private static final int STRIKE_RANGE = 50; // 50 points around current price for ATM
 
     public DhanWebSocketClient(URI serverUri) {
         super(serverUri);
@@ -31,23 +34,24 @@ public class DhanWebSocketClient extends WebSocketClient {
 
     public static void main(String[] args) {
         try {
-            String accessToken = "YOUR_ACCESS_TOKEN";
-            String clientId = "YOUR_CLIENT_ID";
+            String accessToken = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4NDE2NTIwLCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMTIwODI3MyJ9.aKANXnP3hkgtPLEx8yL9dYOruZxpRaRt2q3blu1_bvbCFQ-apcvrU9wKfP1UQXLl1Ry07Ui_PapdjZtOoPabhA";
+            String clientId = "1101208273";
             String url = "wss://api-feed.dhan.co?version=2&token=" + accessToken + "&clientId=" + clientId + "&authType=2";
             DhanWebSocketClient client = new DhanWebSocketClient(new URI(url));
             client.connect();
 
-            // Schedule OptionFind() every 40 minutes
             ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
             scheduler.scheduleAtFixedRate(() -> {
                 if (lastTradedPrice > 0) {
                     try {
+                        System.out.println("option finder started.....");
                         instance.OptionFind(lastTradedPrice);
+                        System.out.println("option finder completed.....");
                     } catch (Exception e) {
                         e.printStackTrace();
                     }
                 }
-            }, 0, 40, TimeUnit.MINUTES);
+            }, 0, 1, TimeUnit.MINUTES);
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -91,6 +95,36 @@ public class DhanWebSocketClient extends WebSocketClient {
                 "  ]\n" +
                 "}";
         send(newSubscribeMessage);
+    }
+
+    public void unsubscribeOptions(Set<Integer> securityIds) {
+        if (securityIds.isEmpty()) return;
+
+        StringBuilder instrumentListBuilder = new StringBuilder();
+        List<Integer> idList = new ArrayList<>(securityIds);
+        for (int i = 0; i < idList.size(); i++) {
+            instrumentListBuilder.append("    {\n")
+                    .append("      \"ExchangeSegment\": \"NSE_FNO\",\n")
+                    .append("      \"SecurityId\": \"").append(idList.get(i)).append("\"\n")
+                    .append("    }");
+            if (i < idList.size() - 1) instrumentListBuilder.append(",\n");
+            else instrumentListBuilder.append("\n");
+        }
+
+        String unsubscribeMessage = "{\n" +
+                "  \"RequestCode\": 16,\n" +
+                "  \"InstrumentCount\": " + securityIds.size() + ",\n" +
+                "  \"InstrumentList\": [\n" +
+                instrumentListBuilder +
+                "  ]\n" +
+                "}";
+        send(unsubscribeMessage);
+
+        // Remove from tracking
+        subscribedOptionIds.removeAll(securityIds);
+        securityIds.forEach(securityMap::remove);
+
+        System.out.println("Unsubscribed from options: " + securityIds);
     }
 
     @Override
@@ -153,11 +187,39 @@ public class DhanWebSocketClient extends WebSocketClient {
         OptionFinder.OptionData atmCall = findATMOption(filePath, spotPrice, "CALL", index);
         OptionFinder.OptionData atmPut = findATMOption(filePath, spotPrice, "PUT", index);
 
-        System.out.println("ATM CALL: " + (atmCall != null ? atmCall.customSymbol + " - Security ID: " + atmCall.securityId : "Not Found"));
-        System.out.println("ATM PUT:  " + (atmPut != null ? atmPut.customSymbol + " - Security ID: " + atmPut.securityId : "Not Found"));
+        // Check if we already have subscribed options
+        Set<Integer> existingOptionIds = securityMap.keySet().stream()
+                .filter(id -> id != 13) // Exclude NIFTY index
+                .collect(Collectors.toSet());
 
-        if (atmCall != null) securityMap.put(atmCall.securityId, atmCall.customSymbol);
-        if (atmPut != null) securityMap.put(atmPut.securityId, atmPut.customSymbol);
+        boolean needToUpdate = false;
+
+        if (atmCall != null && !existingOptionIds.contains(atmCall.securityId)) {
+            needToUpdate = true;
+        }
+        if (atmPut != null && !existingOptionIds.contains(atmPut.securityId)) {
+            needToUpdate = true;
+        }
+
+        if (!needToUpdate) {
+            System.out.println("Same ATM CALL and PUT already subscribed. Skipping option finder.");
+            return;
+        }
+
+        // Unsubscribe existing options if needed
+        if (!existingOptionIds.isEmpty()) {
+            unsubscribeOptions(existingOptionIds);
+        }
+
+        // Subscribe to new options
+        if (atmCall != null) {
+            securityMap.put(atmCall.securityId, atmCall.customSymbol);
+            subscribedOptionIds.add(atmCall.securityId);
+        }
+        if (atmPut != null) {
+            securityMap.put(atmPut.securityId, atmPut.customSymbol);
+            subscribedOptionIds.add(atmPut.securityId);
+        }
 
         List<Map<String, String>> instruments = new ArrayList<>();
         if (atmCall != null) {
@@ -193,6 +255,9 @@ public class DhanWebSocketClient extends WebSocketClient {
                         int strike = extractStrike(symbol);
                         LocalDate expiry = extractExpiryDate(symbol);
                         if (expiry == null || expiry.isBefore(today) || expiry.getDayOfWeek() != DayOfWeek.THURSDAY) return null;
+
+                        // Check if strike is within range
+                        if (Math.abs(strike - spotPrice) > STRIKE_RANGE) return null;
 
                         int secId = Integer.parseInt(tokens[2].trim());
 
