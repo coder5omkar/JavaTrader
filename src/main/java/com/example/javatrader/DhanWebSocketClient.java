@@ -1,5 +1,10 @@
 package com.example.javatrader;
 
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.java_websocket.client.WebSocketClient;
 import org.java_websocket.handshake.ServerHandshake;
 
@@ -23,9 +28,26 @@ public class DhanWebSocketClient extends WebSocketClient {
     private static final int STRIKE_RANGE = 50; // 50 points around current price for ATM
     private static String url ;
 
+    private static final String BOOTSTRAP_SERVERS = "localhost:9092"; // or your Kafka server address
+    private static final String NIFTY_TOPIC = "nifty-ltp";
+    private static final String CALL_TOPIC = "call-ltp";
+    private static final String PUT_TOPIC = "put-ltp";
+
+    private final Producer<String, String> kafkaProducer;
+
     public DhanWebSocketClient(URI serverUri) {
         super(serverUri);
         instance = this;
+        this.kafkaProducer = createKafkaProducer();
+    }
+
+    private Producer<String, String> createKafkaProducer() {
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP_SERVERS);
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.ACKS_CONFIG, "1");
+        return new KafkaProducer<>(props);
     }
 
     public static final Map<Integer, String> securityMap = new HashMap<>();
@@ -35,7 +57,7 @@ public class DhanWebSocketClient extends WebSocketClient {
 
     public static void main(String[] args) {
         try {
-            String accessToken = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4NTAxODc1LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMTIwODI3MyJ9.I-MRNZOBalsTu1g1g-irRfkPGtcgnRH45630A_TKpgMYrbg-fhormWVCCzTvSCZXDbpwIoZ1-ENd4vMk3LeYwA";
+            String accessToken = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJpc3MiOiJkaGFuIiwicGFydG5lcklkIjoiIiwiZXhwIjoxNzQ4NjcyMzQ0LCJ0b2tlbkNvbnN1bWVyVHlwZSI6IlNFTEYiLCJ3ZWJob29rVXJsIjoiIiwiZGhhbkNsaWVudElkIjoiMTEwMTIwODI3MyJ9.tP9wOg7vCVWnY0LPGsyq-tGmE7zCsFKHlcmnkdjHdN3eAG5xg1VkzgdU3nu7ce7dOXjX0H6cDn5hJZOEzyI3jw";
             String clientId = "1101208273";
             url = "wss://api-feed.dhan.co?version=2&token=" + accessToken + "&clientId=" + clientId + "&authType=2";
             DhanWebSocketClient client = new DhanWebSocketClient(new URI(url));
@@ -159,17 +181,24 @@ public class DhanWebSocketClient extends WebSocketClient {
 
             lastTradedPrice = ltp;
             DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd MMM yy hh:mm:ss a");
-            String formattedDateTime = ltt.format(formatter); // <-- FIXED
+            String formattedDateTime = ltt.format(formatter);
 
             System.out.printf("%s (ID: %d) - LTP: ₹%.2f, LTT (Local): %s\n",
                     securityName, securityId, ltp, formattedDateTime);
-//            System.out.println("_____________________________________________________________");
 
+            // Create JSON message for Kafka
+            String jsonMessage = String.format("{\"securityId\":%d,\"securityName\":\"%s\",\"ltp\":%.2f,\"timestamp\":\"%s\"}",
+                    securityId, securityName, ltp, formattedDateTime);
+
+            // Publish to appropriate Kafka topic
             if (securityName.equals("NIFTY 50")) {
+                kafkaProducer.send(new ProducerRecord<>(NIFTY_TOPIC, String.valueOf(securityId), jsonMessage));
                 DatabaseUtil.saveToDB("nifty_data", securityId, securityName, ltp, ltt);
             } else if (securityName.endsWith("CALL")) {
+                kafkaProducer.send(new ProducerRecord<>(CALL_TOPIC, String.valueOf(securityId), jsonMessage));
                 DatabaseUtil.saveToDB("call_data", securityId, securityName, ltp, ltt);
             } else if (securityName.endsWith("PUT")) {
+                kafkaProducer.send(new ProducerRecord<>(PUT_TOPIC, String.valueOf(securityId), jsonMessage));
                 DatabaseUtil.saveToDB("put_data", securityId, securityName, ltp, ltt);
             }
 
@@ -182,6 +211,9 @@ public class DhanWebSocketClient extends WebSocketClient {
     @Override
     public void onClose(int code, String reason, boolean remote) {
         System.out.println("WebSocket closed. Code: " + code + ", Reason: " + reason);
+        // Close Kafka producer
+        kafkaProducer.close();
+
         // Optional: add delay before reconnect
         try {
             Thread.sleep(5000); // 5 seconds delay
@@ -190,7 +222,6 @@ public class DhanWebSocketClient extends WebSocketClient {
         }
         // Reconnect logic
         reconnectWebSocket();
-
     }
 
     public void reconnectWebSocket() {
@@ -211,10 +242,14 @@ public class DhanWebSocketClient extends WebSocketClient {
     public void OptionFind(float price) throws IOException {
         String filePath = "instrument_cache.csv";
         int spotPrice = Math.round(price);
+        System.out.println("price nifty to be searching -" +price);
         String index = "NIFTY";
 
         OptionFinder.OptionData atmCall = findATMOption(filePath, spotPrice, "CALL", index);
         OptionFinder.OptionData atmPut = findATMOption(filePath, spotPrice, "PUT", index);
+
+        System.out.println("ATM CALL: " + (atmCall != null ? atmCall.customSymbol + " - Security ID: " + atmCall.securityId : "Not Found"));
+        System.out.println("ATM PUT:  " + (atmPut != null ? atmPut.customSymbol + " - Security ID: " + atmPut.securityId : "Not Found"));
 
         // Check if we already have subscribed options
         Set<Integer> existingOptionIds = securityMap.keySet().stream()
@@ -289,6 +324,7 @@ public class DhanWebSocketClient extends WebSocketClient {
                         if (Math.abs(strike - spotPrice) > STRIKE_RANGE) return null;
 
                         int secId = Integer.parseInt(tokens[2].trim());
+//                        System.out.println("Expiry.." + expiry);
 
                         OptionFinder.OptionData data = new OptionFinder.OptionData();
                         data.customSymbol = symbol;
@@ -322,13 +358,38 @@ public class DhanWebSocketClient extends WebSocketClient {
         try {
             String[] parts = symbol.split(" ");
             int day = Integer.parseInt(parts[1]);
-            Month month = Month.valueOf(parts[2].toUpperCase());
+            String monthStr = parts[2].toUpperCase();
+            Month month;
+
+            switch (monthStr) {
+                case "JAN": month = Month.JANUARY; break;
+                case "FEB": month = Month.FEBRUARY; break;
+                case "MAR": month = Month.MARCH; break;
+                case "APR": month = Month.APRIL; break;
+                case "MAY": month = Month.MAY; break;
+                case "JUN": month = Month.JUNE; break;
+                case "JUL": month = Month.JULY; break;
+                case "AUG": month = Month.AUGUST; break;
+                case "SEP": month = Month.SEPTEMBER; break;
+                case "OCT": month = Month.OCTOBER; break;
+                case "NOV": month = Month.NOVEMBER; break;
+                case "DEC": month = Month.DECEMBER; break;
+                default: return null;
+            }
+
             int year = Year.now().getValue();
             LocalDate date = LocalDate.of(year, month, day);
-            if (date.isBefore(LocalDate.now())) date = date.plusYears(1);
+
+
+            if (date.isBefore(LocalDate.now())) {
+                date = date.plusYears(1);
+            }
+//            System.out.println("Symbol: " + symbol + ", parts: " + Arrays.toString(parts) +"date: " + date);
+
             return date;
         } catch (Exception e) {
             return null;
         }
     }
+
 }

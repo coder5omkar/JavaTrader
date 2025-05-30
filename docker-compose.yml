@@ -15,6 +15,8 @@ services:
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      # Auto-create topics (comma-separated list)
+      KAFKA_CREATE_TOPICS: "nifty-ltp:1:1,call-ltp:1:1,put-ltp:1:1"
     depends_on:
       - zookeeper
 
